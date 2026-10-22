@@ -1,227 +1,151 @@
-import operator
-from typing import Annotated, Literal, TypedDict
+"""Agentic RAG demo: a stateful LangGraph agent with a single retrieval tool.
+
+Flow:  agent -> (tool call?) -> retrieve -> grade -> agent -> ... -> END
+
+* agent    decides whether it needs evidence; if so it calls the tool
+* retrieve runs the tool and appends the result to the conversation
+* grade    checks the evidence; sends the agent back to re-search, or gives up
+
+Run `uv run python seed.py` once before this file.
+"""
+
+from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 
 load_dotenv()
 from langchain_chroma import Chroma
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
 
 MAX_RETRIES = 2
 
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
-    """carries the conversation and model tool calls"""
-    documents: list
-    """stores evidence returned by Chroma"""
-    retry_count: int
-    """prevents an unlimited rewrite loop"""
-    decision: str
-    """names the next route"""
-    answer: str
-    """this together with sources and status describe outcome"""
-    sources: list[str]
-    status: str
-    trace: Annotated[list[str], operator.add]
-    """records which nodes actually ran"""
+# --- 1. The tool: wraps a Chroma retriever so the model can call it -----------
 
-
-class Assessment(BaseModel):
-    decision: Literal["answer", "rewrite"]
-    reason: str
-
-
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-vector_store = Chroma(
+retriever = Chroma(
     collection_name="architecture_records",
-    embedding_function=embeddings,
+    embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
     persist_directory="./chroma_db",
-)
-
-retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-
-model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+).as_retriever(search_kwargs={"k": 3})
 
 
 @tool
 def search_architecture_records(query: str) -> str:
     """Search approved architecture records when evidence is needed."""
-    documents = retriever.invoke(query)
     return "\n\n".join(
         f'{doc.metadata["source"]}: {doc.page_content}'
-        for doc in documents
+        for doc in retriever.invoke(query)
     )
 
-decision_model = model.bind_tools([search_architecture_records])
-assessment_model = model.with_structured_output(Assessment)
 
-DECIDE_PROMPT = SystemMessage(
-    "You are an assistant for an engineering team. Answer small talk or general "
-    "questions directly. For any question about how our systems are built, you "
-    "must call search_architecture_records before answering."
+# --- 2. Models: one LLM, used two ways ----------------------------------------
+
+model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+
+# the agent may emit tool calls
+agent_model = model.bind_tools([search_architecture_records])
+
+
+# the grader must answer with this exact shape
+class Grade(BaseModel):
+    sufficient: bool
+
+
+grader_model = model.with_structured_output(Grade)
+
+
+# --- 3. State: what survives between nodes ------------------------------------
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]  # reducer: nodes append, not replace
+    retries: int  # how many times we sent the agent back to search
+    status: str  # "answered" or "needs_review"
+
+
+# --- 4. Nodes: plain functions that read state and return a partial update ----
+
+SYSTEM = SystemMessage(
+    "You are an assistant for an engineering team. For any question about how our "
+    "systems are built, call search_architecture_records before answering and "
+    "cite the ADR ids you used. Answer general questions directly."
 )
 
 
-def question_of(state: AgentState) -> str:
-    """The original user question is always the first message."""
-    return state["messages"][0].content
+def agent(state: AgentState) -> dict:
+    response = agent_model.invoke([SYSTEM, *state["messages"]])
+    return {"messages": [response], "status": "answered"}
 
 
-def evidence_of(state: AgentState) -> str:
-    return "\n\n".join(
-        f'{doc.metadata["source"]}: {doc.page_content}'
-        for doc in state["documents"]
-    )
+# prebuilt node: executes the tool calls in the last message, appends ToolMessages
+retrieve = ToolNode([search_architecture_records])
 
 
-def decide_or_respond(state: AgentState) -> dict:
-    response = decision_model.invoke([DECIDE_PROMPT, *state["messages"]])
-    update = {"messages": [response], "trace": ["decide"]}
-    if not response.tool_calls:
-        update |= {"answer": response.content, "status": "answered_directly"}
-    return update
-
-
-def retrieve(state: AgentState) -> dict:
-    """Run the model's tool calls against Chroma and feed results back."""
-    tool_messages, documents = [], []
-    for call in state["messages"][-1].tool_calls:
-        docs = retriever.invoke(call["args"]["query"])
-        documents.extend(docs)
-        tool_messages.append(
-            ToolMessage(
-                content="\n\n".join(
-                    f'{d.metadata["source"]}: {d.page_content}' for d in docs
-                ),
-                tool_call_id=call["id"],
-            )
-        )
-    return {
-        "messages": tool_messages,
-        "documents": documents,
-        "sources": sorted({d.metadata["source"] for d in documents}),
-        "trace": ["retrieve"],
-    }
-
-
-def assess(state: AgentState) -> dict:
-    """Ask the model whether the evidence actually answers the question."""
-    verdict = assessment_model.invoke(
+def grade(state: AgentState) -> dict:
+    question = state["messages"][0].content
+    evidence = state["messages"][-1].content
+    verdict = grader_model.invoke(
         [
-            SystemMessage(
-                "Decide whether the evidence is enough to answer the question. "
-                "Reply 'answer' if it is, 'rewrite' if a different search is needed."
-            ),
-            HumanMessage(
-                f"Question: {question_of(state)}\n\nEvidence:\n{evidence_of(state)}"
-            ),
+            SystemMessage("Is the evidence enough to answer the question?"),
+            HumanMessage(f"Question: {question}\n\nEvidence:\n{evidence}"),
         ]
     )
-    return {"decision": verdict.decision, "trace": [f"assess:{verdict.decision}"]}
-
-
-def rewrite(state: AgentState) -> dict:
-    """Send the model back to search again with a different query."""
+    if verdict.sufficient:
+        return {}
+    if state["retries"] >= MAX_RETRIES:
+        return {
+            "status": "needs_review",
+            "messages": [
+                AIMessage("No architecture record covers this. Escalating to the architecture team.")
+            ],
+        }
     return {
+        "retries": state["retries"] + 1,
         "messages": [
-            HumanMessage(
-                "The retrieved records did not answer the question. Call "
-                "search_architecture_records again with a differently phrased query."
-            )
+            HumanMessage("That evidence does not answer the question. Search again with different wording.")
         ],
-        "retry_count": state["retry_count"] + 1,
-        "trace": ["rewrite"],
     }
 
 
-def answer(state: AgentState) -> dict:
-    """Write the final answer grounded only in the retrieved records."""
-    response = model.invoke(
-        [
-            SystemMessage(
-                "Answer the question using only the evidence. Cite the ADR ids you used."
-            ),
-            HumanMessage(
-                f"Question: {question_of(state)}\n\nEvidence:\n{evidence_of(state)}"
-            ),
-        ]
-    )
-    return {"answer": response.content, "status": "answered", "trace": ["answer"]}
+# --- 5. Edges: routing functions look at state and name the next node ---------
+
+def after_agent(state: AgentState) -> str:
+    return "retrieve" if state["messages"][-1].tool_calls else END
 
 
-def review(state: AgentState) -> dict:
-    """Give up after MAX_RETRIES and hand the question to a human."""
-    return {
-        "answer": (
-            f"No architecture record covers this after {state['retry_count']} "
-            "retries. Escalated to the architecture team for review."
-        ),
-        "status": "needs_review",
-        "trace": ["review"],
-    }
-
-
-def route_after_decision(state: AgentState) -> str:
-    last_message = state["messages"][-1]
-    if last_message.tool_calls:
-        return "retrieve"
-    return "direct"
-
-
-def route_after_assessment(state: AgentState) -> str:
-    if state["decision"] == "answer":
-        return "answer"
-    if state["retry_count"] < MAX_RETRIES:
-        return "rewrite"
-    return "review"
+def after_grade(state: AgentState) -> str:
+    return END if state["status"] == "needs_review" else "agent"
 
 
 graph = StateGraph(AgentState)
-
-graph.add_node("decide_or_respond", decide_or_respond)
+graph.add_node("agent", agent)
 graph.add_node("retrieve", retrieve)
-graph.add_node("assess", assess)
-graph.add_node("rewrite", rewrite)
-graph.add_node("answer", answer)
-graph.add_node("review", review)
+graph.add_node("grade", grade)
 
-graph.add_edge(START, "decide_or_respond")
-graph.add_conditional_edges(
-    "decide_or_respond",
-    route_after_decision,
-    {"direct": END, "retrieve": "retrieve"},
-)
-graph.add_edge("retrieve", "assess")
-graph.add_conditional_edges(
-    "assess",
-    route_after_assessment,
-    {"answer": "answer", "rewrite": "rewrite", "review": "review"},
-)
-graph.add_edge("rewrite", "decide_or_respond")
-graph.add_edge("answer", END)
-graph.add_edge("review", END)
+graph.add_edge(START, "agent")
+graph.add_conditional_edges("agent", after_agent, ["retrieve", END])
+graph.add_edge("retrieve", "grade")
+graph.add_conditional_edges("grade", after_grade, ["agent", END])
 
 app = graph.compile()
 
+
+# --- 6. Demo -------------------------------------------------------------------
+
 def ask(question: str) -> None:
-    result = app.invoke(
-        {"messages": [HumanMessage(question)], "retry_count": 0, "documents": []}
-    )
+    result = app.invoke({"messages": [HumanMessage(question)], "retries": 0})
     print(f"\nQ: {question}")
-    print(f"A: {result['answer']}")
     print(f"status: {result['status']}")
-    print(f"sources: {result.get('sources', [])}")
-    print(f"trace: {' -> '.join(result['trace'])}")
+    print(f"A: {result['messages'][-1].content}")
 
 
 if __name__ == "__main__":
-    ask("Hi! What can you help me with?")
+    app.get_graph().print_ascii()
+    # ask("Hi! What can you help me with?")
     ask("Where do we store customer-generated CSV exports, and for how long?")
-    ask("Which frontend framework do we use for the admin dashboard?")
+    # ask("Which frontend framework do we use for the admin dashboard?")
