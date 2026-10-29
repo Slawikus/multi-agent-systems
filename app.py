@@ -2,11 +2,16 @@ import json
 import operator
 from typing import Annotated, Literal
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 from typing_extensions import TypedDict
+
 
 
 RELEASE_DATA = {
