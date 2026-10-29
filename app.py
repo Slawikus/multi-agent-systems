@@ -1,151 +1,211 @@
-"""Agentic RAG demo: a stateful LangGraph agent with a single retrieval tool.
+import json
+import operator
+from typing import Annotated, Literal
 
-Flow:  agent -> (tool call?) -> retrieve -> grade -> agent -> ... -> END
-
-* agent    decides whether it needs evidence; if so it calls the tool
-* retrieve runs the tool and appends the result to the conversation
-* grade    checks the evidence; sends the agent back to re-search, or gives up
-
-Run `uv run python seed.py` once before this file.
-"""
-
-from typing import Annotated, TypedDict
-
-from dotenv import load_dotenv
-
-load_dotenv()
-from langchain_chroma import Chroma
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.agents import create_agent
+from langchain.tools import tool
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
+from typing_extensions import TypedDict
 
-MAX_RETRIES = 2
 
+RELEASE_DATA = {
+    "2.4.0": {
+        "tests": {
+            "ok": True,
+            "passed": 428,
+            "failed": 0,
+            "coverage": 86,
+            "source": "ci://payments/2.4.0",
+        },
+        "operations": {
+            "ok": True,
+            "migration_check": "passed",
+            "rollback_package": "available",
+            "source": "deploy://payments/2.4.0",
+        },
+    },
+    "2.4.1": {
+        "tests": {
+            "ok": True,
+            "passed": 431,
+            "failed": 0,
+            "coverage": 87,
+            "source": "ci://payments/2.4.1",
+        },
+        "operations": {
+            "ok": False,
+            "error": "deployment readiness service unavailable",
+            "source": "deploy://payments/2.4.1",
+        },
+    },
+}
 
-# --- 1. The tool: wraps a Chroma retriever so the model can call it -----------
-
-retriever = Chroma(
-    collection_name="architecture_records",
-    embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
-    persist_directory="./chroma_db",
-).as_retriever(search_kwargs={"k": 3})
+@tool
+def get_test_results(release_id: str) -> dict:
+    """Return CI test evidence for a release."""
+    return RELEASE_DATA[release_id]["tests"]
 
 
 @tool
-def search_architecture_records(query: str) -> str:
-    """Search approved architecture records when evidence is needed."""
-    return "\n\n".join(
-        f'{doc.metadata["source"]}: {doc.page_content}'
-        for doc in retriever.invoke(query)
-    )
+def get_operations_readiness(release_id: str) -> dict:
+    """Return deployment-readiness evidence for a release."""
+    return RELEASE_DATA[release_id]["operations"]
 
 
-# --- 2. Models: one LLM, used two ways ----------------------------------------
-
-model = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
-
-# the agent may emit tool calls
-agent_model = model.bind_tools([search_architecture_records])
-
-
-# the grader must answer with this exact shape
-class Grade(BaseModel):
-    sufficient: bool
+class SpecialistReport(BaseModel):
+    specialist: Literal["testing", "operations"]
+    status: Literal["ready", "not_ready", "unavailable"]
+    summary: str
+    evidence: list[str]
+    source: str
 
 
-grader_model = model.with_structured_output(Grade)
+class ReleaseDecision(BaseModel):
+    decision: Literal["go", "no_go", "needs_human"]
+    rationale: str
+    blockers: list[str]
+    sources: list[str]
 
 
-# --- 3. State: what survives between nodes ------------------------------------
+MODEL = "openai:gpt-5-mini"
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]  # reducer: nodes append, not replace
-    retries: int  # how many times we sent the agent back to search
-    status: str  # "answered" or "needs_review"
+testing_agent = create_agent(
+    model=MODEL,
+    tools=[get_test_results],
+    response_format=SpecialistReport,
+    system_prompt=(
+        "You are the testing specialist for a software release. "
+        "Always call get_test_results for the supplied release ID. "
+        "Use only the returned evidence. Set status to ready when no tests "
+        "failed, not_ready when tests failed, and unavailable when the tool "
+        "cannot provide evidence."
+    ),
+)
 
-
-# --- 4. Nodes: plain functions that read state and return a partial update ----
-
-SYSTEM = SystemMessage(
-    "You are an assistant for an engineering team. For any question about how our "
-    "systems are built, call search_architecture_records before answering and "
-    "cite the ADR ids you used. Answer general questions directly."
+operations_agent = create_agent(
+    model=MODEL,
+    tools=[get_operations_readiness],
+    response_format=SpecialistReport,
+    system_prompt=(
+        "You are the operations specialist for a software release. "
+        "Always call get_operations_readiness for the supplied release ID. "
+        "Use only the returned evidence. Set status to ready only when the "
+        "migration check passed and a rollback package is available. Set "
+        "status to unavailable when the evidence source reports an error."
+    ),
 )
 
 
-def agent(state: AgentState) -> dict:
-    response = agent_model.invoke([SYSTEM, *state["messages"]])
-    return {"messages": [response], "status": "answered"}
+release_coordinator = create_agent(
+    model=MODEL,
+    tools=[],
+    response_format=ReleaseDecision,
+    system_prompt=(
+        "You are the release coordinator. Use only the specialist reports. "
+        "Return go only when every specialist is ready. Return no_go when a "
+        "specialist is not_ready. Return needs_human when required evidence "
+        "is unavailable. Preserve the supplied source identifiers."
+    ),
+)
 
 
-# prebuilt node: executes the tool calls in the last message, appends ToolMessages
-retrieve = ToolNode([search_architecture_records])
+class ReleaseState(TypedDict):
+    release_id: str
+    reports: Annotated[list[dict], operator.add]
+    final_decision: dict
 
 
-def grade(state: AgentState) -> dict:
-    question = state["messages"][0].content
-    evidence = state["messages"][-1].content
-    verdict = grader_model.invoke(
-        [
-            SystemMessage("Is the evidence enough to answer the question?"),
-            HumanMessage(f"Question: {question}\n\nEvidence:\n{evidence}"),
-        ]
-    )
-    if verdict.sufficient:
-        return {}
-    if state["retries"] >= MAX_RETRIES:
-        return {
-            "status": "needs_review",
+def _run_specialist(agent, release_id: str) -> dict:
+    result = agent.invoke(
+        {
             "messages": [
-                AIMessage("No architecture record covers this. Escalating to the architecture team.")
-            ],
+                {
+                    "role": "user",
+                    "content": f"Assess release {release_id}.",
+                }
+            ]
         }
-    return {
-        "retries": state["retries"] + 1,
-        "messages": [
-            HumanMessage("That evidence does not answer the question. Search again with different wording.")
-        ],
-    }
+    )
+    return result["structured_response"].model_dump()
 
 
-# --- 5. Edges: routing functions look at state and name the next node ---------
-
-def after_agent(state: AgentState) -> str:
-    return "retrieve" if state["messages"][-1].tool_calls else END
-
-
-def after_grade(state: AgentState) -> str:
-    return END if state["status"] == "needs_review" else "agent"
+def testing_node(state: ReleaseState) -> dict:
+    report = _run_specialist(testing_agent, state["release_id"])
+    return {"reports": [report]}
 
 
-graph = StateGraph(AgentState)
-graph.add_node("agent", agent)
-graph.add_node("retrieve", retrieve)
-graph.add_node("grade", grade)
-
-graph.add_edge(START, "agent")
-graph.add_conditional_edges("agent", after_agent, ["retrieve", END])
-graph.add_edge("retrieve", "grade")
-graph.add_conditional_edges("grade", after_grade, ["agent", END])
-
-app = graph.compile()
+def operations_node(state: ReleaseState) -> dict:
+    report = _run_specialist(operations_agent, state["release_id"])
+    return {"reports": [report]}
 
 
-# --- 6. Demo -------------------------------------------------------------------
+def coordinator_node(state: ReleaseState) -> dict:
+    ordered_reports = sorted(
+        state["reports"],
+        key=lambda report: report["specialist"],
+    )
 
-def ask(question: str) -> None:
-    result = app.invoke({"messages": [HumanMessage(question)], "retries": 0})
-    print(f"\nQ: {question}")
-    print(f"status: {result['status']}")
-    print(f"A: {result['messages'][-1].content}")
+    result = release_coordinator.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Decide whether this release can proceed:\n\n"
+                        + json.dumps(ordered_reports, indent=2)
+                    ),
+                }
+            ]
+        }
+    )
+
+    decision = result["structured_response"]
+    return {"final_decision": decision.model_dump()}
 
 
-if __name__ == "__main__":
-    app.get_graph().print_ascii()
-    # ask("Hi! What can you help me with?")
-    ask("Where do we store customer-generated CSV exports, and for how long?")
-    # ask("Which frontend framework do we use for the admin dashboard?")
+builder = StateGraph(ReleaseState)
+
+builder.add_node("testing_agent", testing_node)
+builder.add_node("operations_agent", operations_node)
+builder.add_node("release_coordinator", coordinator_node)
+
+builder.add_edge(START, "testing_agent")
+builder.add_edge(START, "operations_agent")
+builder.add_edge(
+    ["testing_agent", "operations_agent"],
+    "release_coordinator",
+)
+builder.add_edge("release_coordinator", END)
+
+graph = builder.compile()
+
+
+def review_release(release_id: str) -> None:
+    result = graph.invoke(
+        {
+            "release_id": release_id,
+            "reports": [],
+            "final_decision": {},
+        }
+    )
+
+    print(f"\nRELEASE {release_id}")
+
+    for report in sorted(
+        result["reports"],
+        key=lambda item: item["specialist"],
+    ):
+        print(
+            f'{report["specialist"]}: '
+            f'{report["status"]} — {report["summary"]}'
+        )
+
+    decision = result["final_decision"]
+    print("decision:", decision["decision"])
+    print("rationale:", decision["rationale"])
+    print("sources:", decision["sources"])
+
+
+review_release("2.4.0")
+# review_release("2.4.1")
