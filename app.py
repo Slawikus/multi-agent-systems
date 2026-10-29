@@ -184,6 +184,7 @@ builder.add_edge(
 builder.add_edge("release_coordinator", END)
 
 graph = builder.compile()
+graph.get_graph().print_ascii()
 
 
 def review_release(release_id: str) -> None:
